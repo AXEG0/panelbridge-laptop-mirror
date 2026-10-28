@@ -40,6 +40,9 @@ Duplication, and an experimental KMDF driver copies each frame into the panel's 
 
 - In a demanding DX12 game capped at 60 fps, the panel showed a steady 60 fps. Capture and copy took
   about 2–4 ms per frame.
+- With the GPU fully loaded (*Resident Evil 4* with a DLSS neural-rendering mod, about 35 fps), every game
+  frame reached the panel over a 30-minute session. Before readback copies were pipelined, a busy GPU
+  held the panel to about 12 fps.
 - The earlier user-mode mirror through Windows' Basic Display output was limited to about 25 fps.
 
 ## How it works
@@ -109,8 +112,11 @@ by default, and Windows then refuses to load the driver (Win32 error 487).
 - In games, choose the virtual display and cap the frame rate at 60, the panel's firmware mode. Some
   games remember the monitor. For example, *Resident Evil 4* stores it as `DisplayName` in
   `local_config.ini`, and a game pointed at the laptop screen ends the session.
-- Avoid alt-tab out of exclusive fullscreen. Windows may reapply the normal layout, which ends the
-  session.
+- Games that reset the display mode, for example on alt-tab out of exclusive fullscreen, make Windows
+  reattach its own laptop-screen output. The mirror detaches it again, up to three times a minute, before
+  it ends the session. Prefer exclusive fullscreen: *Resident Evil 4* resets the mode when it starts in
+  borderless and then ran at a few fps.
+- Don't run the launcher again while a session is running. Its administrator prompt ends the session.
 - **Administrator prompts can't be shown.** The secure desktop can't be captured, so the mirror closes
   and the screen looks frozen. Press Esc once to cancel a hidden prompt; Ctrl+Alt+Del also cancels it.
   Do administrator work, including one-time game installers, without a session running.

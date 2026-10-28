@@ -25,28 +25,41 @@ sealed class Mirror : IDisposable
     [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr hwnd);
     [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr hwnd, IntPtr hdc);
     [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr hwnd, out Rectangle rect);
+    [DllImport("winmm.dll")] static extern uint timeBeginPeriod(uint period);
+    [DllImport("winmm.dll")] static extern uint timeEndPeriod(uint period);
+    [DllImport("kernel32.dll")]
+    static extern bool SetProcessInformation(IntPtr process, int infoClass, ref PROCESS_POWER_THROTTLING_STATE info, int size);
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct PROCESS_POWER_THROTTLING_STATE { public uint Version, ControlMask, StateMask; }
 
     const uint SRCCOPY = 0x00CC0020;
     const int COLORONCOLOR = 3;
+    const int ProcessPowerThrottling = 4;
+    const uint PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION = 4;
 
     readonly string _deviceName;
     readonly bool _blit;
     readonly double _area;
     readonly FramebufferSink _sink;
     readonly Action _onPanelLost;
+    readonly Func<bool> _onPanelReattached;
     Thread _thread;
     volatile bool _stop;
     IntPtr _hwnd;
 
     // blit=false only captures, to measure how fast the virtual display produces frames on its own.
     // area < 1 draws only that fraction of the width and height, to see how panel cost scales with pixels.
-    public Mirror(string deviceName, bool blit = true, double area = 1, FramebufferSink sink = null, Action onPanelLost = null)
+    // onPanelReattached returns true once Windows' panel output is detached again; false ends the session.
+    public Mirror(string deviceName, bool blit = true, double area = 1, FramebufferSink sink = null, Action onPanelLost = null,
+        Func<bool> onPanelReattached = null)
     {
         _deviceName = deviceName;
         _blit = blit;
         _area = area;
         _sink = sink;
         _onPanelLost = onPanelLost;
+        _onPanelReattached = onPanelReattached;
     }
 
     public void Start(IntPtr hwnd)
@@ -66,27 +79,40 @@ sealed class Mirror : IDisposable
 
     void Run()
     {
-        while (!_stop)
+        // The 1 ms frame polling in Loop otherwise sleeps a whole 15.6 ms timer tick. Windows 11 may ignore the
+        // request for a process without a visible window unless timer-resolution throttling is turned off.
+        var throttling = new PROCESS_POWER_THROTTLING_STATE { Version = 1, ControlMask = PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION };
+        SetProcessInformation(Process.GetCurrentProcess().Handle, ProcessPowerThrottling, ref throttling,
+            Marshal.SizeOf<PROCESS_POWER_THROTTLING_STATE>());
+        timeBeginPeriod(1);
+        try
         {
-            try { Capture(); }
-            catch (PanelLostException e)
+            while (!_stop)
             {
-                Console.WriteLine(e.Message);
-                _onPanelLost?.Invoke();
-                return;
-            }
-            catch (Exception e)
-            {
-                if (_sink != null && e.HResult == unchecked((int)0x80070005) && _onPanelLost != null)
+                try { Capture(); }
+                catch (PanelLostException e)
                 {
-                    Console.WriteLine("Secure desktop detected; restoring the normal display.");
-                    _onPanelLost();
+                    Console.WriteLine(e.Message);
+                    _onPanelLost?.Invoke();
                     return;
                 }
-                // Mode changes, UAC prompts and fullscreen switches invalidate the duplication; start over.
-                Console.WriteLine($"Capture restarted: {e.Message}");
-                Thread.Sleep(500);
+                catch (Exception e)
+                {
+                    if (_sink != null && e.HResult == unchecked((int)0x80070005) && _onPanelLost != null)
+                    {
+                        Console.WriteLine("Secure desktop detected; restoring the normal display.");
+                        _onPanelLost();
+                        return;
+                    }
+                    // Mode changes, UAC prompts and fullscreen switches invalidate the duplication; start over.
+                    Console.WriteLine($"Capture restarted: {e.Message}");
+                    Thread.Sleep(500);
+                }
             }
+        }
+        finally
+        {
+            timeEndPeriod(1);
         }
     }
 
@@ -107,7 +133,7 @@ sealed class Mirror : IDisposable
                 GpuPriority.Raise(device);
                 var mode = dup.Description.ModeDescription;
                 Console.WriteLine($"Capturing {_deviceName} on {adapter.Description1.Description}: {mode.Width}x{mode.Height} {mode.Format}");
-                using var staging = device.CreateTexture2D(new Texture2DDescription
+                var desc = new Texture2DDescription
                 {
                     Width = mode.Width,
                     Height = mode.Height,
@@ -118,18 +144,35 @@ sealed class Mirror : IDisposable
                     Usage = ResourceUsage.Staging,
                     BindFlags = BindFlags.None,
                     CPUAccessFlags = CpuAccessFlags.Read,
-                });
-                Loop(dup, ctx, staging, (int)mode.Width, (int)mode.Height);
+                };
+                var staging = new ID3D11Texture2D[StagingDepth];
+                try
+                {
+                    for (int i = 0; i < staging.Length; i++) staging[i] = device.CreateTexture2D(desc);
+                    Loop(dup, ctx, staging, (int)mode.Width, (int)mode.Height);
+                }
+                finally
+                {
+                    foreach (var s in staging) s?.Dispose();
+                }
             }
         }
     }
 
-    void Loop(IDXGIOutputDuplication dup, ID3D11DeviceContext ctx, ID3D11Texture2D staging, int w, int h)
+    // A game that saturates the GPU (RE4 with DLSS 5) delays each readback copy by up to ~75 ms. Waiting for one
+    // copy before taking the next frame held the panel to 12 fps, so several copies stay in flight instead.
+    const int StagingDepth = 3;
+
+    readonly record struct Pending(int Slot, long Submitted, long PresentTime, long Wait, int Skipped);
+
+    void Loop(IDXGIOutputDuplication dup, ID3D11DeviceContext ctx, ID3D11Texture2D[] staging, int w, int h)
     {
         IntPtr hdc = _sink == null && _blit ? GetDC(_hwnd) : IntPtr.Zero;
         if (hdc != IntPtr.Zero) SetStretchBltMode(hdc, COLORONCOLOR);
         var bmi = new BITMAPINFOHEADER { biSize = Marshal.SizeOf<BITMAPINFOHEADER>(), biHeight = -h, biPlanes = 1, biBitCount = 32 };
         var stats = new Stats();
+        var pending = new Queue<Pending>();
+        int next = 0;
         long nextFallbackCheck = 0;
         try
         {
@@ -139,12 +182,17 @@ sealed class Mirror : IDisposable
                 // the registry, which reattaches Windows' own panel output. Writing frames then corrupts the picture.
                 if (_sink != null && Stopwatch.GetTimestamp() >= nextFallbackCheck)
                 {
-                    if (FramebufferSink.FallbackOwnsPanel())
+                    if (FramebufferSink.FallbackOwnsPanel() && !(_onPanelReattached?.Invoke() ?? false))
                         throw new PanelLostException("Windows reattached its own panel output; restoring the normal display.");
                     nextFallbackCheck = Stopwatch.GetTimestamp() + Stopwatch.Frequency / 4;
                 }
+                // Show finished copies oldest first; block only when every staging texture is in flight.
+                while (pending.Count > 0 && Show(ctx, staging, pending.Peek(), pending.Count == staging.Length, hdc, ref bmi, w, h, stats))
+                    pending.Dequeue();
+
                 long t0 = Stopwatch.GetTimestamp();
-                var r = dup.AcquireNextFrame(100, out OutduplFrameInfo info, out IDXGIResource res);
+                // While copies are pending, poll briefly so a finished one isn't held behind a 100 ms wait.
+                var r = dup.AcquireNextFrame(pending.Count > 0 ? 1u : 100u, out OutduplFrameInfo info, out IDXGIResource res);
                 if (r.Code == Vortice.DXGI.ResultCode.WaitTimeout.Code) { stats.Report(); continue; }
                 r.CheckError();
                 long t1 = Stopwatch.GetTimestamp();
@@ -152,41 +200,54 @@ sealed class Mirror : IDisposable
                 {
                     if (info.LastPresentTime == 0) continue; // only the pointer moved
                     using (var tex = res.QueryInterface<ID3D11Texture2D>())
-                        ctx.CopyResource(staging, tex);
+                        ctx.CopyResource(staging[next], tex);
+                    ctx.Flush();
+                    pending.Enqueue(new Pending(next, t1, info.LastPresentTime, t1 - t0, (int)info.AccumulatedFrames - 1));
+                    next = (next + 1) % staging.Length;
                 }
                 finally
                 {
                     res.Dispose();
                     dup.ReleaseFrame();
                 }
-
-                var map = ctx.Map(staging, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
-                long t2 = Stopwatch.GetTimestamp();
-                try
-                {
-                    if (_blit && _sink != null)
-                        _sink.Present(map.DataPointer, (uint)w, (uint)h, map.RowPitch);
-                    else if (_blit)
-                    {
-                        GetClientRect(_hwnd, out var client); // Rectangle holds left, top, right, bottom
-                        bmi.biWidth = (int)(map.RowPitch / 4);
-                        int dw = (int)(client.Width * _area), dh = (int)(client.Height * _area);
-                        StretchDIBits(hdc, 0, 0, dw, dh, 0, 0, (int)(w * _area), (int)(h * _area), map.DataPointer, ref bmi, 0, SRCCOPY);
-                    }
-                }
-                finally
-                {
-                    ctx.Unmap(staging, 0);
-                }
-                long t3 = Stopwatch.GetTimestamp();
-                stats.Add(t1 - t0, t2 - t1, t3 - t2, t3 - info.LastPresentTime, (int)info.AccumulatedFrames - 1);
-                stats.Report();
             }
         }
         finally
         {
             if (hdc != IntPtr.Zero) ReleaseDC(_hwnd, hdc);
         }
+    }
+
+    // Maps one copied frame and hands it to the panel or window. Returns false if the copy hasn't finished and wait is off.
+    bool Show(ID3D11DeviceContext ctx, ID3D11Texture2D[] staging, Pending p, bool wait, IntPtr hdc, ref BITMAPINFOHEADER bmi,
+        int w, int h, Stats stats)
+    {
+        var tex = staging[p.Slot];
+        var r = ctx.Map(tex, 0, MapMode.Read, wait ? Vortice.Direct3D11.MapFlags.None : Vortice.Direct3D11.MapFlags.DoNotWait,
+            out MappedSubresource map);
+        if (r.Code == Vortice.DXGI.ResultCode.WasStillDrawing.Code) return false;
+        r.CheckError();
+        long t2 = Stopwatch.GetTimestamp();
+        try
+        {
+            if (_blit && _sink != null)
+                _sink.Present(map.DataPointer, (uint)w, (uint)h, map.RowPitch);
+            else if (_blit)
+            {
+                GetClientRect(_hwnd, out var client); // Rectangle holds left, top, right, bottom
+                bmi.biWidth = (int)(map.RowPitch / 4);
+                int dw = (int)(client.Width * _area), dh = (int)(client.Height * _area);
+                StretchDIBits(hdc, 0, 0, dw, dh, 0, 0, (int)(w * _area), (int)(h * _area), map.DataPointer, ref bmi, 0, SRCCOPY);
+            }
+        }
+        finally
+        {
+            ctx.Unmap(tex, 0);
+        }
+        long t3 = Stopwatch.GetTimestamp();
+        stats.Add(p.Wait, t2 - p.Submitted, t3 - t2, t3 - p.PresentTime, p.Skipped);
+        stats.Report();
+        return true;
     }
 
     static (IDXGIAdapter1, IDXGIOutput) FindOutput(IDXGIFactory1 factory, string deviceName)

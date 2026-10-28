@@ -59,7 +59,8 @@ static class Program
         int areaArg = Array.IndexOf(args, "--area");
         double area = areaArg >= 0 ? double.Parse(args[areaArg + 1], System.Globalization.CultureInfo.InvariantCulture) : 1;
         using var mirror = new Mirror(source.DeviceName, blit: !args.Contains("--noblit"), area: area, sink: sink,
-            onPanelLost: direct ? () => { if (!form.IsDisposed) form.BeginInvoke(form.Close); } : null);
+            onPanelLost: direct ? () => { if (!form.IsDisposed) form.BeginInvoke(form.Close); } : null,
+            onPanelReattached: direct ? DetachPanelAgain : null);
         int heavyArg = Array.IndexOf(args, "--heavy");
         int heavy = heavyArg >= 0 ? int.Parse(args[heavyArg + 1]) : 0;
         using var pattern = args.Contains("--pattern") ? new PatternForm(source.Bounds, heavy) : null;
@@ -79,6 +80,42 @@ static class Program
         if (!direct && !args.Contains("--keep-windows"))
             Console.WriteLine($"Moved {Windows.MoveAll(source.Bounds, target.Bounds)} windows back to the panel");
         return 0;
+    }
+
+    // Games that reset the display mode (RE4 a few seconds after starting borderless, or on alt-tab out of exclusive
+    // fullscreen) apply the normal layout staged for restarts, which reattaches the panel output. Detach it again with
+    // the session's own topology script and re-stage the normal layout, at most three times a minute, instead of
+    // ending the session.
+    static readonly Queue<DateTime> Redetaches = new();
+
+    static bool DetachPanelAgain()
+    {
+        while (Redetaches.Count > 0 && DateTime.UtcNow - Redetaches.Peek() > TimeSpan.FromMinutes(1)) Redetaches.Dequeue();
+        if (Redetaches.Count >= 3) return false;
+        Redetaches.Enqueue(DateTime.UtcNow);
+        Console.WriteLine("Windows reattached its own panel output; detaching it again.");
+        return RunTopology("Detach") && RunTopology("StageRestore") && !FramebufferSink.FallbackOwnsPanel();
+    }
+
+    static bool RunTopology(string mode)
+    {
+        string recovery = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "PanelBridgeRecovery");
+        var start = new System.Diagnostics.ProcessStartInfo("powershell.exe",
+            $"-NoProfile -ExecutionPolicy Bypass -File \"{recovery}\\display-topology.ps1\" -Mode {mode} -StatePath \"{recovery}\\logs\\topology.json\"")
+        {
+            UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true,
+        };
+        using var process = System.Diagnostics.Process.Start(start);
+        var output = process.StandardOutput.ReadToEndAsync();
+        var error = process.StandardError.ReadToEndAsync();
+        if (!process.WaitForExit(30000))
+        {
+            process.Kill();
+            Console.WriteLine($"Display topology {mode} timed out.");
+            return false;
+        }
+        Console.Write(output.Result + error.Result);
+        return process.ExitCode == 0;
     }
 }
 
