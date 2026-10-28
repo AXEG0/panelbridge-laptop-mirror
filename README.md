@@ -53,7 +53,8 @@ Duplication, and an experimental KMDF driver copies each frame into the panel's 
    - It accepts pixel buffers through an IOCTL that only administrators and SYSTEM can open.
    - It never writes GPU registers or changes eDP timing, link or power. It is **not** a WDDM driver.
 3. Windows keeps its own firmware fallback output (`ROOT\BASICDISPLAY`), which draws into the same
-   framebuffer. The session detaches that output from the desktop and makes the virtual display
+   framebuffer. The session attaches the virtual display (it stays off the desktop otherwise, so
+   windows cannot open on an invisible screen), detaches that output and makes the virtual display
    primary. The client stops writing, and ends the session, if Windows reattaches it.
 4. The client (`PanelMirror.exe --driver`) raises its GPU scheduling priority so a busy game cannot
    starve the capture. It then copies every new frame of the virtual display to the panel.
