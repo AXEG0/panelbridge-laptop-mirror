@@ -3,6 +3,21 @@
 Play games rendered by the NVIDIA GPU on a laptop's built-in screen when the Intel graphics driver can't
 drive that screen.
 
+## The problem
+
+On some Optimus laptops without a MUX switch, the built-in screen is wired only to the Intel iGPU. The
+NVIDIA GPU can render, but every frame reaches the screen through the Intel driver. On the tested
+laptop, the Intel driver makes the screen flicker or go black, which points to a faulty panel or eDP
+cable. Tuning PSR, refresh rate and other driver settings didn't help.
+
+Without the Intel driver, Windows falls back to *Microsoft Basic Display Adapter*. That keeps the
+screen working but forces slow software compositing: about 25 fps even for frames the NVIDIA GPU
+renders. So the usual choices were an external monitor, about 25 fps, or replacing hardware.
+
+PanelBridge gets around this without the Intel driver.
+
+## The solution
+
 The panel stays on the image the firmware set up at boot. A virtual monitor (an IddCx Virtual Display
 Driver) is rendered by the NVIDIA GPU. A small user-mode client captures it with DXGI Desktop
 Duplication, and an experimental KMDF driver copies each frame into the panel's firmware framebuffer.
