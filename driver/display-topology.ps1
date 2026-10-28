@@ -74,10 +74,17 @@ if ($Mode -eq 'Snapshot') {
     $state | ConvertTo-Json | Set-Content -Encoding UTF8 -LiteralPath $StatePath
 } elseif ($Mode -eq 'Detach') {
     if (!(Test-Path -LiteralPath $StatePath)) { throw 'Saved display layout is required before detaching.' }
-    $devices = [PanelBridgeTopology]::Devices()
-    $fallback = $devices | Where-Object { $_.Id -ieq 'ROOT\BasicDisplay' -and ($_.Flags -band 1) } | Select-Object -First 1
-    $virtual = $devices | Where-Object { $_.Id -ieq 'Root\MttVDD' -and ($_.Flags -band 1) } | Select-Object -First 1
-    if (!$fallback -or !$virtual) { throw 'Expected an attached fallback output and VDD before this test.' }
+    # After a restart the panel starts on the PCI adapter; the ROOT fallback output only
+    # appears a few seconds after PanelBridge takes that device, and may not be attached yet.
+    $deadline = (Get-Date).AddSeconds(20)
+    do {
+        $devices = [PanelBridgeTopology]::Devices()
+        $fallback = $devices | Where-Object { $_.Id -ieq 'ROOT\BasicDisplay' } | Select-Object -First 1
+        $virtual = $devices | Where-Object { $_.Id -ieq 'Root\MttVDD' -and ($_.Flags -band 1) } | Select-Object -First 1
+        if ($fallback -and $virtual) { break }
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $deadline)
+    if (!$fallback -or !$virtual) { throw 'Expected the fallback output and an attached VDD before this test.' }
     $m = [PanelBridgeTopology]::Current($virtual.Name)
     [PanelBridgeTopology]::Place($virtual.Name,0,0,$m.Width,$m.Height,$true)
     [PanelBridgeTopology]::Place($fallback.Name,0,0,0,0,$false)
@@ -91,9 +98,16 @@ if ($Mode -eq 'Snapshot') {
     }
     $state = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
     $devices = [PanelBridgeTopology]::Devices()
+    # The panel is either the Intel PCI output (fresh boot) or the ROOT fallback (after a switch).
+    $panelIds = @('ROOT\BasicDisplay','PCI\VEN_8086&DEV_9A49&SUBSYS_160C1043&REV_01')
     foreach ($saved in $state | Sort-Object Primary -Descending) {
         $d = $devices | Where-Object Id -ieq $saved.Id | Select-Object -First 1
-        if (!$d) { Write-Output "Display no longer present: $($saved.Id)"; continue }
+        if (!$d -and $panelIds -icontains $saved.Id) { $d = $devices | Where-Object { $panelIds -icontains $_.Id } | Select-Object -First 1 }
+        if (!$d) {
+            # Never leave the invisible VDD as the only desktop; recover-layout retries until the panel returns.
+            if ($saved.Primary) { throw "Primary display not present yet: $($saved.Id)" }
+            Write-Output "Display no longer present: $($saved.Id)"; continue
+        }
         [PanelBridgeTopology]::Place($d.Name,$saved.X,$saved.Y,$saved.Width,$saved.Height,$saved.Primary)
     }
     if ($Mode -eq 'Restore') {

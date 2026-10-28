@@ -6,9 +6,11 @@ try {
         Where-Object ExecutablePath -eq $ClientPath |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     $recoveryPath = Join-Path $env:ProgramData 'PanelBridgeRecovery'
-    if (Test-Path -LiteralPath "$recoveryPath\logs\topology.json") {
-        try { & "$recoveryPath\recover-layout.ps1" -StatePath "$recoveryPath\logs\topology.json" -WaitSeconds $(if ($InteractiveSession) { 180 } else { 0 }) }
-        catch { Write-Output "Display layout restore needs the interactive session: $($_.Exception.Message)" }
+    $layoutState = "$recoveryPath\logs\topology.json"
+    $layoutPending = $false
+    if (Test-Path -LiteralPath $layoutState) {
+        try { & "$recoveryPath\recover-layout.ps1" -StatePath $layoutState -WaitSeconds $(if ($InteractiveSession) { 180 } else { 0 }) -MissingPanelSeconds 5 }
+        catch { $layoutPending = $true; Write-Output "Display layout restore needs the interactive session: $($_.Exception.Message)" }
     }
     $fallback = Get-PnpDevice -InstanceId 'ROOT\BASICDISPLAY\0000' -PresentOnly -ErrorAction SilentlyContinue
     if ($fallback) {
@@ -33,6 +35,11 @@ try {
     } | ForEach-Object {
         & pnputil.exe /delete-driver $_.Driver /uninstall /force
         if ($LASTEXITCODE -notin @(0,3010)) { throw 'Could not remove the experimental driver package.' }
+    }
+    # The panel output can return only after the rebind; retry so the VDD is not left as primary.
+    if ($layoutPending) {
+        try { & "$recoveryPath\recover-layout.ps1" -StatePath $layoutState -WaitSeconds $(if ($InteractiveSession) { 60 } else { 0 }) }
+        catch { Write-Output "Display layout restore still pending: $($_.Exception.Message)" }
     }
     if ($InteractiveSession -and (Test-Path -LiteralPath $ClientPath)) { & $ClientPath --restore-windows }
     Unregister-ScheduledTask -TaskName 'PanelBridgeEmergencyRollback' -Confirm:$false -ErrorAction SilentlyContinue
