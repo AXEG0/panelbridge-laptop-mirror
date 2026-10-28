@@ -1,0 +1,13 @@
+bin/
+obj/
+*.log
+*.log.*
+
+# Driver build output, local toolchain, signed package and machine-specific logs
+driver/obj/
+driver/tools/
+driver/package/
+driver/client/
+driver/reference/
+driver/logs/*
+!driver/logs/.gitkeep
