@@ -7,7 +7,8 @@ using Vortice.DXGI;
 namespace PanelMirror;
 
 // Captures one output with Desktop Duplication on the GPU that renders it, reads each new frame back
-// to system memory and blits it into the mirror window. Prints per-stage timings once a second.
+// to system memory and blits it into the mirror window. Prints per-stage timings once a second and can draw the
+// frame rate on the panel.
 sealed class Mirror : IDisposable
 {
     [StructLayout(LayoutKind.Sequential)]
@@ -46,13 +47,15 @@ sealed class Mirror : IDisposable
     readonly Func<bool> _onPanelReattached;
     Thread _thread;
     volatile bool _stop;
+    volatile bool _fps;
     IntPtr _hwnd;
 
     // blit=false only captures, to measure how fast the virtual display produces frames on its own.
     // area < 1 draws only that fraction of the width and height, to see how panel cost scales with pixels.
     // onPanelReattached returns true once Windows' panel output is detached again; false ends the session.
+    // fps draws the last second's frame rate in the top-left corner; ToggleFps switches it while running.
     public Mirror(string deviceName, bool blit = true, double area = 1, FramebufferSink sink = null, Action onPanelLost = null,
-        Func<bool> onPanelReattached = null)
+        Func<bool> onPanelReattached = null, bool fps = false)
     {
         _deviceName = deviceName;
         _blit = blit;
@@ -60,7 +63,10 @@ sealed class Mirror : IDisposable
         _sink = sink;
         _onPanelLost = onPanelLost;
         _onPanelReattached = onPanelReattached;
+        _fps = fps;
     }
+
+    public void ToggleFps() => _fps = !_fps;
 
     public void Start(IntPtr hwnd)
     {
@@ -143,7 +149,8 @@ sealed class Mirror : IDisposable
                     SampleDescription = new SampleDescription(1, 0),
                     Usage = ResourceUsage.Staging,
                     BindFlags = BindFlags.None,
-                    CPUAccessFlags = CpuAccessFlags.Read,
+                    // Write access lets the fps counter be drawn into the copy before it is shown.
+                    CPUAccessFlags = CpuAccessFlags.Read | CpuAccessFlags.Write,
                 };
                 var staging = new ID3D11Texture2D[StagingDepth];
                 try
@@ -223,13 +230,14 @@ sealed class Mirror : IDisposable
         int w, int h, Stats stats)
     {
         var tex = staging[p.Slot];
-        var r = ctx.Map(tex, 0, MapMode.Read, wait ? Vortice.Direct3D11.MapFlags.None : Vortice.Direct3D11.MapFlags.DoNotWait,
+        var r = ctx.Map(tex, 0, MapMode.ReadWrite, wait ? Vortice.Direct3D11.MapFlags.None : Vortice.Direct3D11.MapFlags.DoNotWait,
             out MappedSubresource map);
         if (r.Code == Vortice.DXGI.ResultCode.WasStillDrawing.Code) return false;
         r.CheckError();
         long t2 = Stopwatch.GetTimestamp();
         try
         {
+            if (_fps) FpsOverlay.Draw(map.DataPointer, map.RowPitch, w, h, stats.Fps);
             if (_blit && _sink != null)
                 _sink.Present(map.DataPointer, (uint)w, (uint)h, map.RowPitch);
             else if (_blit)
@@ -272,6 +280,9 @@ sealed class Mirror : IDisposable
         int _frames, _skipped;
         long _wait, _copy, _blit, _latency, _maxLatency;
 
+        // Frames the game presented in the last full second, shown or skipped.
+        public int Fps { get; private set; }
+
         public void Add(long wait, long copy, long blit, long latency, int skipped)
         {
             _frames++; _skipped += Math.Max(0, skipped);
@@ -289,6 +300,7 @@ sealed class Mirror : IDisposable
                     $"present->blit avg {_latency * MsPerTick / _frames,4:F1} ms max {_maxLatency * MsPerTick,4:F1} ms");
             else
                 Console.WriteLine("  0 fps  (virtual display unchanged)");
+            Fps = _frames + _skipped;
             _since = now; _frames = _skipped = 0; _wait = _copy = _blit = _latency = _maxLatency = 0;
         }
     }

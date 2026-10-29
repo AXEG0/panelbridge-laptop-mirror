@@ -46,7 +46,8 @@ static class Program
         if (direct) sink.PrintInfo();
         Console.WriteLine(direct ? $"Mirroring {source.DeviceName} {source.Bounds} -> firmware framebuffer" :
             $"Mirroring {source.DeviceName} {source.Bounds} -> {target.DeviceName} {target.Bounds}");
-        Console.WriteLine("Ctrl+Alt+F12 or Ctrl+C quits." + (clip ? " The mouse is kept on the virtual display." : ""));
+        Console.WriteLine("Ctrl+Alt+F12 or Ctrl+C quits, Ctrl+Alt+F11 toggles the fps counter." +
+            (clip ? " The mouse is kept on the virtual display." : ""));
 
         // The mirror window covers the panel, so whatever was open there would be hidden behind it.
         if (!direct && !args.Contains("--keep-windows"))
@@ -60,7 +61,8 @@ static class Program
         double area = areaArg >= 0 ? double.Parse(args[areaArg + 1], System.Globalization.CultureInfo.InvariantCulture) : 1;
         using var mirror = new Mirror(source.DeviceName, blit: !args.Contains("--noblit"), area: area, sink: sink,
             onPanelLost: direct ? () => { if (!form.IsDisposed) form.BeginInvoke(form.Close); } : null,
-            onPanelReattached: direct ? DetachPanelAgain : null);
+            onPanelReattached: direct ? DetachPanelAgain : null, fps: args.Contains("--fps"));
+        form.FpsHotkey += mirror.ToggleFps;
         int heavyArg = Array.IndexOf(args, "--heavy");
         int heavy = heavyArg >= 0 ? int.Parse(args[heavyArg + 1]) : 0;
         using var pattern = args.Contains("--pattern") ? new PatternForm(source.Bounds, heavy) : null;
@@ -155,7 +157,8 @@ static class Displays
 sealed class MirrorForm : Form
 {
     const int WS_EX_TOPMOST = 0x8, WS_EX_TOOLWINDOW = 0x80, WS_EX_NOACTIVATE = 0x08000000;
-    const int WM_HOTKEY = 0x312, MOD_ALT = 1, MOD_CONTROL = 2, VK_F12 = 0x7B;
+    const int WM_HOTKEY = 0x312, MOD_ALT = 1, MOD_CONTROL = 2, VK_F11 = 0x7A, VK_F12 = 0x7B;
+    const int QuitHotkey = 1, FpsHotkeyId = 2;
 
     [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr hwnd, int id, int mods, int vk);
     [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr hwnd, int id);
@@ -163,6 +166,8 @@ sealed class MirrorForm : Form
     readonly Rectangle _bounds;
     readonly Rectangle _cursorClip;
     readonly System.Windows.Forms.Timer _clipTimer = new() { Interval = 250 };
+
+    public event Action FpsHotkey;
 
     public MirrorForm(Rectangle bounds, Rectangle cursorClip)
     {
@@ -195,7 +200,8 @@ sealed class MirrorForm : Form
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
-        RegisterHotKey(Handle, 1, MOD_CONTROL | MOD_ALT, VK_F12);
+        RegisterHotKey(Handle, QuitHotkey, MOD_CONTROL | MOD_ALT, VK_F12);
+        RegisterHotKey(Handle, FpsHotkeyId, MOD_CONTROL | MOD_ALT, VK_F11);
     }
 
     protected override void OnShown(EventArgs e)
@@ -209,7 +215,8 @@ sealed class MirrorForm : Form
     {
         _clipTimer.Stop();
         Cursor.Clip = Rectangle.Empty;
-        UnregisterHotKey(Handle, 1);
+        UnregisterHotKey(Handle, QuitHotkey);
+        UnregisterHotKey(Handle, FpsHotkeyId);
         base.OnFormClosing(e);
     }
 
@@ -220,7 +227,11 @@ sealed class MirrorForm : Form
 
     protected override void WndProc(ref Message m)
     {
-        if (m.Msg == WM_HOTKEY) Close();
+        if (m.Msg == WM_HOTKEY)
+        {
+            if ((int)m.WParam == FpsHotkeyId) FpsHotkey?.Invoke();
+            else Close();
+        }
         base.WndProc(ref m);
     }
 }

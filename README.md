@@ -109,6 +109,8 @@ by default, and Windows then refuses to load the driver (Win32 error 487).
 - Run `driver\launch-session.ps1`, or a desktop shortcut to it, and approve the prompt while the laptop
   screen is still primary.
 - **Ctrl+Alt+F12** ends the session and restores the normal display.
+- **Ctrl+Alt+F11** shows or hides the fps counter in the top-left corner. The mirror draws it, so it
+  shows even where in-game overlays don't, such as exclusive fullscreen. Sessions start with it on.
 - In games, choose the virtual display and cap the frame rate at 60, the panel's firmware mode. Some
   games remember the monitor. For example, *Resident Evil 4* stores it as `DisplayName` in
   `local_config.ini`, and a game pointed at the laptop screen ends the session.

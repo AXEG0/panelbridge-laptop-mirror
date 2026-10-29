@@ -66,7 +66,7 @@ try {
         & "$recovery\display-topology.ps1" -Mode Detach -StatePath $topologyState
         & "$recovery\display-topology.ps1" -Mode StageRestore -StatePath $topologyState
     }
-    $clientArgs = @(if ($Session) { '--driver' } else { '--driver';'--pattern';'--duration';'65' })
+    $clientArgs = @(if ($Session) { '--driver';'--fps' } else { '--driver';'--pattern';'--duration';'65' })
     if ($Session -and $SessionSeconds -gt 0) { $clientArgs += @('--duration',$SessionSeconds.ToString()) }
     $client = Start-Process -FilePath "$PSScriptRoot\client\PanelMirror.exe" -ArgumentList $clientArgs `
         -RedirectStandardOutput "$PSScriptRoot\logs\capture.log" -RedirectStandardError "$PSScriptRoot\logs\capture-error.log" -WindowStyle Hidden -PassThru
